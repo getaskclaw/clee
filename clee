@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""keep: a searchable index of the Markdown your AI agents write. See DESIGN.md."""
+"""clee: a searchable index of the Markdown your AI agents write. See DESIGN.md."""
 import argparse
 import datetime as dt
 import hashlib
@@ -44,32 +44,32 @@ FIELDS = ("source", "path", "agent", "created_at", "updated_at", "imported_at",
           "sha256")
 
 
-class KeepError(Exception):
+class CleeError(Exception):
     pass
 
 
 class Parser(argparse.ArgumentParser):
     def error(self, message):  # any error exits 1, not argparse's 2
         self.print_usage(sys.stderr)
-        sys.stderr.write("keep: %s\n" % message)
+        sys.stderr.write("clee: %s\n" % message)
         sys.exit(1)
 
 
 def db_path():
     return os.path.abspath(os.path.expanduser(
-        os.environ.get("KEEP_DB") or "~/.keep/keep.db"))
+        os.environ.get("CLEE_DB") or "~/.clee/clee.db"))
 
 
 def connect(init=False):
     p = db_path()
     if not init and not os.path.exists(p):
-        raise KeepError("no database at %s; run 'keep init'" % p)
+        raise CleeError("no database at %s; run 'clee init'" % p)
     con = sqlite3.connect(p, timeout=5, isolation_level=None)  # autocommit
     con.row_factory = sqlite3.Row
     if init and not con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
         con.executescript(SCHEMA)
     if con.execute("PRAGMA user_version").fetchone()[0] != VERSION:
-        raise KeepError("%s is not a Keep database of this version; "
+        raise CleeError("%s is not a Clee database of this version; "
                         "see Rebuild in DESIGN.md" % p)
     return con
 
@@ -90,8 +90,8 @@ def quote(s):
 
 
 def render(r):
-    """The item file: Keep's frontmatter, then the body verbatim."""
-    fm = ["keep_id: " + quote(r["id"])] + [k + ": " + quote(r[k]) for k in FIELDS]
+    """The item file: Clee's frontmatter, then the body verbatim."""
+    fm = ["clee_id: " + quote(r["id"])] + [k + ": " + quote(r[k]) for k in FIELDS]
     return "\n".join(["---"] + fm + ["---", ""]).encode() + r["body"].encode()
 
 
@@ -109,7 +109,7 @@ def get_row(con, i):
     r = con.execute("SELECT id, %s, body FROM items WHERE id=?"
                     % ", ".join(FIELDS), (i,)).fetchone()
     if r is None:
-        raise KeepError("no item %s" % i)
+        raise CleeError("no item %s" % i)
     return r
 
 
@@ -139,7 +139,7 @@ def is_dir(p):  # symlinks are not followed
 
 def cmd_init(a):
     if sqlite3.sqlite_version_info < (3, 24, 0):
-        raise KeepError("SQLite %s is older than 3.24" % sqlite3.sqlite_version)
+        raise CleeError("SQLite %s is older than 3.24" % sqlite3.sqlite_version)
     os.makedirs(os.path.dirname(db_path()), exist_ok=True)
     connect(init=True)
 
@@ -147,7 +147,7 @@ def cmd_init(a):
 def cmd_import(a):
     inbox = os.fsencode(a.inbox)  # bytes, so names are checked as UTF-8
     if not os.path.isdir(inbox):
-        raise KeepError("%s is not a directory" % a.inbox)
+        raise CleeError("%s is not a directory" % a.inbox)
     con = connect()
     seen, frozen = set(), set()  # frozen: machines whose rows are not deleted
     found = {}  # machine directory -> number of files read from it
@@ -156,7 +156,7 @@ def cmd_import(a):
         return path.decode("utf-8", "backslashreplace")
 
     def say(msg):
-        sys.stderr.write("keep: %s\n" % one_line(msg))
+        sys.stderr.write("clee: %s\n" % one_line(msg))
 
     def skip(path, why):
         frozen.add(machine)
@@ -213,7 +213,7 @@ def cmd_import(a):
                 seen.add(i)
                 found[machine] += 1
     if not seen:  # a missing mount, say: delete nothing, even on a first run
-        raise KeepError("no readable .md files in %s; deleted nothing"
+        raise CleeError("no readable .md files in %s; deleted nothing"
                         % a.inbox)
     rows = con.execute("SELECT id, source FROM items").fetchall()
     sources = {source.encode() for _, source in rows}
@@ -231,7 +231,7 @@ def cmd_import(a):
 
 def cmd_search(a):
     if a.limit < 1:
-        raise KeepError("--limit must be at least 1")
+        raise CleeError("--limit must be at least 1")
     terms = [t.casefold() for t in a.terms]  # each argument is one substring
     where = [(c, v) for c, v in (("source", a.source), ("agent", a.agent))
              if v is not None]
@@ -255,9 +255,9 @@ def cmd_show(a):
 
 
 def cmd_flag(a):
-    out = os.environ.get("KEEP_OUT")
+    out = os.environ.get("CLEE_OUT")
     if not out:
-        raise KeepError("KEEP_OUT is not set")
+        raise CleeError("CLEE_OUT is not set")
     r = get_row(connect(), a.id)
     d = os.path.join(os.path.expanduser(out), "Items")
     os.makedirs(d, exist_ok=True)
@@ -276,10 +276,10 @@ def main(argv):
         try:
             b.decode("utf-8")
         except UnicodeError:
-            sys.stderr.write("keep: argument is not UTF-8: %s\n"
+            sys.stderr.write("clee: argument is not UTF-8: %s\n"
                              % one_line(b.decode("utf-8", "backslashreplace")))
             sys.exit(1)
-    ap = Parser(prog="keep")
+    ap = Parser(prog="clee")
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
     sub.add_parser("init")
     sub.add_parser("import").add_argument("inbox")
@@ -294,11 +294,11 @@ def main(argv):
     try:
         globals()["cmd_" + a.cmd](a)
         sys.stdout.flush()
-    except BrokenPipeError:  # e.g. `keep search | head -1`: stop quietly
+    except BrokenPipeError:  # e.g. `clee search | head -1`: stop quietly
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         sys.exit(1)
-    except (KeepError, sqlite3.Error, OSError) as e:
-        sys.stderr.write("keep: %s\n" % e)
+    except (CleeError, sqlite3.Error, OSError) as e:
+        sys.stderr.write("clee: %s\n" % e)
         sys.exit(1)
 
 
