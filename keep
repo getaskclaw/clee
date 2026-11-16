@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""keep: a searchable index of the Markdown your AI agents write. See DESIGN.md."""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import stat
+import sys
+
+VERSION = 2  # PRAGMA user_version of the schema below
+
+SCHEMA = """
+BEGIN;
+CREATE TABLE items (
+  id          TEXT PRIMARY KEY,  -- first 12 hex digits of SHA-256 of source/path
+  source      TEXT NOT NULL,  -- host: the inbox/<machine> directory name
+  path        TEXT NOT NULL,  -- file path inside that directory
+  agent       TEXT NOT NULL,  -- frontmatter agent, else profiles/<name>/ in path, else ''
+  created_at  TEXT NOT NULL,  -- frontmatter created_at, else mtime at first import
+  updated_at  TEXT NOT NULL,  -- file mtime when the content last changed
+  imported_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  sha256      TEXT NOT NULL,  -- SHA-256 of the file bytes
+  body        TEXT NOT NULL,
+  UNIQUE (source, path)
+);
+PRAGMA user_version = 2;
+COMMIT;
+"""
+
+UPSERT = """
+INSERT INTO items(id, source, path, agent, created_at, updated_at, sha256, body)
+VALUES (:id, :source, :path, :agent, COALESCE(:created, :mtime), :mtime,
+        :sha256, :body)
+ON CONFLICT (source, path) DO UPDATE SET
+  agent = :agent, created_at = COALESCE(:created, created_at),
+  updated_at = :mtime, sha256 = :sha256, body = :body
+WHERE sha256 != :sha256
+"""
+
+FIELDS = ("source", "path", "agent", "created_at", "updated_at", "imported_at",
+          "sha256")
+
+
+class KeepError(Exception):
+    pass
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):  # any error exits 1, not argparse's 2
+        self.print_usage(sys.stderr)
+        sys.stderr.write("keep: %s\n" % message)
+        sys.exit(1)
+
+
+def db_path():
+    return os.path.abspath(os.path.expanduser(
+        os.environ.get("KEEP_DB") or "~/.keep/keep.db"))
+
+
+def connect(init=False):
+    p = db_path()
+    if not init and not os.path.exists(p):
+        raise KeepError("no database at %s; run 'keep init'" % p)
+    con = sqlite3.connect(p, timeout=5, isolation_level=None)  # autocommit
+    con.row_factory = sqlite3.Row
+    if init and not con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
+        con.executescript(SCHEMA)
+    if con.execute("PRAGMA user_version").fetchone()[0] != VERSION:
+        raise KeepError("%s is not a Keep database of this version; "
+                        "see Rebuild in DESIGN.md" % p)
+    return con
+
+
+def item_id(source, path):
+    return hashlib.sha256((source + "/" + path).encode()).hexdigest()[:12]
+
+
+def one_line(s):
+    return re.sub(r"[\t\r\n]", " ", s)
+
+
+def quote(s):
+    """A JSON string, with the characters YAML forbids escaped."""
+    return re.sub(r"[\x7f-\x9f\ufffe\uffff]",
+                  lambda m: "\\u%04x" % ord(m.group()),
+                  json.dumps(s, ensure_ascii=False))
+
+
+def render(r):
+    """The item file: Keep's frontmatter, then the body verbatim."""
+    fm = ["keep_id: " + quote(r["id"])] + [k + ": " + quote(r[k]) for k in FIELDS]
+    return "\n".join(["---"] + fm + ["---", ""]).encode() + r["body"].encode()
+
+
+def utc(ts):
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def item_name(r):
+    s = re.sub(r"[^A-Za-z0-9]+", "-", r["path"].rsplit("/", 1)[-1]).lower()
+    return "%s-%s.md" % (r["id"], s[:40].strip("-"))
+
+
+def get_row(con, i):
+    r = con.execute("SELECT id, %s, body FROM items WHERE id=?"
+                    % ", ".join(FIELDS), (i,)).fetchone()
+    if r is None:
+        raise KeepError("no item %s" % i)
+    return r
+
+
+def frontmatter(body):
+    """Top-level `key: value` lines between a first line `---` and the next."""
+    lines = [s.rstrip("\r") for s in body.split("\n")]
+    fm = {}
+    if lines[0] != "---":
+        return fm
+    for s in lines[1:]:
+        if s == "---":
+            return fm
+        k, sep, v = s.partition(":")
+        v = v.strip()
+        if len(v) > 1 and v[0] == v[-1] and v[0] in "'\"":
+            v = v[1:-1]
+        if sep:  # an indented key keeps its spaces, so never matches
+            fm[k.rstrip()] = v
+    return {}  # never closed: not frontmatter
+
+
+def is_dir(p):  # symlinks are not followed
+    return stat.S_ISDIR(os.lstat(p).st_mode)
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_init(a):
+    if sqlite3.sqlite_version_info < (3, 24, 0):
+        raise KeepError("SQLite %s is older than 3.24" % sqlite3.sqlite_version)
+    os.makedirs(os.path.dirname(db_path()), exist_ok=True)
+    connect(init=True)
+
+
+def cmd_import(a):
+    inbox = os.fsencode(a.inbox)  # bytes, so names are checked as UTF-8
+    if not os.path.isdir(inbox):
+        raise KeepError("%s is not a directory" % a.inbox)
+    con = connect()
+    seen, skipped = set(), []
+
+    def skip(path, why):
+        skipped.append(path)
+        sys.stderr.write("keep: skipped %s: %s\n" % (
+            one_line(path.decode("utf-8", "backslashreplace")), why))
+
+    for machine in sorted(os.listdir(inbox)):
+        top = os.path.join(inbox, machine)
+        if not is_dir(top):
+            continue
+        for d, dirs, files in os.walk(
+                top, onerror=lambda e: skip(e.filename, e.strerror)):
+            dirs.sort()
+            for f in sorted(files):
+                if not f.endswith(b".md"):
+                    continue
+                path = os.path.join(d, f)
+                try:
+                    st = os.lstat(path)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue  # symlinks, FIFOs and the like are ignored
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                except OSError as e:
+                    skip(path, e.strerror)
+                    continue
+                try:
+                    body = data.decode("utf-8")
+                    source = machine.decode("utf-8")
+                    rel = os.path.relpath(path, top).decode("utf-8")
+                except UnicodeError:
+                    skip(path, "not UTF-8")
+                    continue
+                i = item_id(source, rel)
+                seen.add(i)
+                fm = frontmatter(body)
+                m = re.search(r"(?:^|/)profiles/([^/]+)/", rel)
+                con.execute(UPSERT, {
+                    "id": i, "source": source, "path": rel, "body": body,
+                    "agent": fm.get("agent") or (m.group(1) if m else ""),
+                    "created": fm.get("created_at") or None,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "mtime": utc(st.st_mtime)})
+    if skipped:
+        sys.exit(1)  # each skipped file was named on stderr; nothing deleted
+    for (i,) in con.execute("SELECT id FROM items").fetchall():
+        if i not in seen:
+            con.execute("DELETE FROM items WHERE id=?", (i,))
+
+
+def cmd_search(a):
+    if a.limit < 1:
+        raise KeepError("--limit must be at least 1")
+    terms = [t.casefold() for t in " ".join(a.terms).split()]
+    sql = "SELECT id, updated_at, source, path, body FROM items"
+    args = []
+    if a.source:
+        sql += " WHERE source = ?"
+        args.append(a.source)
+    sql += " ORDER BY updated_at DESC, source, path"
+    n = 0
+    for r in connect().execute(sql, args):
+        text = (r["path"] + "\n" + r["body"]).casefold()
+        if all(t in text for t in terms):
+            print("\t".join(one_line(r[k]) for k in r.keys()[:4]))
+            n += 1
+            if n == a.limit:
+                break
+
+
+def cmd_show(a):
+    sys.stdout.buffer.write(render(get_row(connect(), a.id)))
+
+
+def cmd_flag(a):
+    out = os.environ.get("KEEP_OUT")
+    if not out:
+        raise KeepError("KEEP_OUT is not set")
+    r = get_row(connect(), a.id)
+    d = os.path.join(out, "Items")
+    os.makedirs(d, exist_ok=True)
+    name = item_name(r)
+    tmp = os.path.join(d, ".%s.%d.tmp" % (name, os.getpid()))
+    with open(tmp, "wb") as f:
+        f.write(render(r))
+    os.replace(tmp, os.path.join(d, name))  # flagging again overwrites it
+
+
+def main(argv):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    ap = Parser(prog="keep")
+    sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+    sub.add_parser("init")
+    sub.add_parser("import").add_argument("inbox")
+    p = sub.add_parser("search")
+    p.add_argument("terms", nargs="*")
+    p.add_argument("--source", metavar="MACHINE")
+    p.add_argument("--limit", type=int, default=20)
+    for name in ("show", "flag"):
+        sub.add_parser(name).add_argument("id")
+    a = ap.parse_args(argv)
+    try:
+        globals()["cmd_" + a.cmd](a)
+    except (KeepError, sqlite3.Error, OSError) as e:
+        sys.stderr.write("keep: %s\n" % e)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
