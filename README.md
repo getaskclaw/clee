@@ -1,5 +1,7 @@
 # AskClaw Keep
 
+An Obsidian alternative built for AI agents: hundreds of notes a day, zero clutter.
+
 A searchable index of the Markdown your AI agents write.
 
 Agents keep writing Markdown files as usual. Each machine pushes them to one central machine, where Keep indexes them in SQLite so you can search all of it. Only the items you flag are written back out as plain Markdown, so the folder you read stays small.
@@ -52,7 +54,7 @@ Run `keep import` from cron, one at a time: `flock -n ~/.keep/import.lock keep i
 ## What it is not
 
 - Not a sync tool. Machines push files; Keep only reads them.
-- Not a note-taking app or two-way sync. Editing an item file never changes the database.
+- Not an editor or two-way sync: agents write, humans read. Editing an item file never changes the database.
 - Not a backup tool. Back up the inbox like any folder (see Rebuild and Non-goals in DESIGN.md).
 - Not multi-user. Keep assumes one person and machines that person runs.
 - Not a secret store. Keep sets no file permissions, and flagged items are exported verbatim; do not log credentials.
