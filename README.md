@@ -7,8 +7,8 @@ Agents keep writing Markdown files as usual. Each machine pushes them to one cen
 ## How it works
 
 1. Each machine pushes its Markdown one way to `inbox/<machine>/` on the central machine (rsync or Syncthing, not part of Keep). Give every machine its own name.
-2. `keep import inbox` mirrors the inbox: one row per `.md` file (dot-directories such as `.claude/` included), holding its latest content along with its machine, path, agent (the frontmatter's `agent`, else `<name>` from `profiles/<name>/` in the path), creation time (the frontmatter's `created_at`, else the mtime at first import), last content change, import time and content hash. A file removed from the inbox loses its row. Reruns change nothing. A file it cannot read is named on stderr and the run exits 1; fix it on the machine it came from.
-3. `keep search` lists the most recently changed files, or the ones matching your terms.
+2. `keep import inbox` mirrors the inbox: one row per `.md` file (dot-directories such as `.claude/` included), holding its latest content along with its machine, path, agent (the frontmatter's `agent`, else `<name>` from `profiles/<name>/` in the path), creation time (the frontmatter's `created_at`, else the mtime at first import), last content change, import time and content hash. A file removed from the inbox loses its row. Reruns change nothing. A file it cannot read is named on stderr, that machine's rows are not deleted, and the run exits 1; fix it on the machine it came from. An inbox with no readable files (a missing mount, say) deletes nothing and exits 1.
+3. `keep search` lists the most recently changed files, or the ones matching your terms (each argument is one substring, so quote a phrase), optionally for one machine (`--source`) or agent (`--agent`).
 4. On the central machine, you run `keep flag <id>` to write a snapshot of that item as a Markdown file right away: exactly what `keep show <id>` prints. Flag it again to refresh it after the file changes. Agents only write files.
 
 The inbox is the record: Keep only reads it, and the database can be deleted and rebuilt from it with the same IDs.
@@ -40,7 +40,9 @@ export KEEP_OUT=~/notes/keep        # where flagged Markdown goes (required by f
 keep init
 keep import ~/keep-inbox            # source = machine directory name
 keep search                         # most recently changed first
-keep search "churn"
+keep search churn retention         # both words
+keep search "disk full"             # the phrase
+keep search --agent scout           # one agent's files
 keep show 3f9a1c0b7e21              # IDs come from search
 keep flag 3f9a1c0b7e21              # writes $KEEP_OUT/Items/3f9a1c0b7e21-q4-churn-md.md
 ```
@@ -55,7 +57,7 @@ Run `keep import` from cron, one at a time: `flock -n ~/.keep/import.lock keep i
 - Not multi-user. Keep assumes one person and machines that person runs.
 - Not a secret store. Keep sets no file permissions, and flagged items are exported verbatim; do not log credentials.
 
-Design, schema and acceptance tests: [DESIGN.md](DESIGN.md).
+Design and schema: [DESIGN.md](DESIGN.md). Acceptance test: [acceptance.sh](acceptance.sh).
 
 ## License
 

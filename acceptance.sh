@@ -2,6 +2,7 @@
 # acceptance.sh — exits non-zero on the first failure
 set -eu
 T=$(mktemp -d); I=$T/inbox
+trap 'chmod -R u+rwx "$T"; rm -rf "$T"' EXIT
 export KEEP_DB=$T/db/sub/keep.db KEEP_OUT=$T/out
 n()   { sqlite3 "$KEEP_DB" "SELECT count(*) FROM items WHERE $1"; }
 q()   { sqlite3 "$KEEP_DB" "SELECT $1 FROM items WHERE $2"; }
@@ -48,14 +49,15 @@ s3=$(q id "source='vps3'"); rm "$I/vps3/same.md"; keep import "$I"
 put vps3/same.md "same"; keep import "$I"; [ "$(q id "source='vps3'")" = "$s3" ]
 
 # a skipped file is named on stderr and import exits 1; the rest still
-# imports, and nothing is deleted
-printf 'ok\377\n' >"$I/vps2/bin.md"; printf '\000nul\n' >"$I/vps2/nul.md"
+# imports, and nothing is deleted from that machine; other machines are
+printf 'ok\377\n' >"$I/vps2/bin.md"; printf '\000afternul\n' >"$I/vps2/zero.md"
 bad=$I/vps2/$(printf 'bad\377').md; printf x >"$bad"; rm "$I/vps2/empty.md"
+rm "$I/vps1/same.md"
 no "keep import '$I'"; grep -qxF "keep: skipped $I/vps2/bin.md: not UTF-8" "$T/err"
 grep -qxF "keep: skipped $I/vps2/bad\\xff.md: not UTF-8" "$T/err"
 [ "$(wc -l <"$T/err")" -eq 2 ]
-[ "$(n "path='bin.md'")" -eq 0 ]; [ "$(n "path='nul.md'")" -eq 1 ]
-[ "$(n "path='empty.md'")" -eq 1 ]
+[ "$(n "path='bin.md'")" -eq 0 ]; [ "$(n "path='zero.md'")" -eq 1 ]
+[ "$(n "path='empty.md'")" -eq 1 ]; [ "$(n "source='vps1' AND path='same.md'")" -eq 0 ]
 rm "$I/vps2/bin.md" "$bad"; keep import "$I"; [ "$(n "path='empty.md'")" -eq 0 ]
 if [ "$(id -u)" -ne 0 ]; then                   # root can read anything
   put vps2/locked/x.md x; keep import "$I"
@@ -68,6 +70,21 @@ if [ "$(id -u)" -ne 0 ]; then                   # root can read anything
   keep import "$I"; [ "$(n "path='locked/x.md'")" -eq 0 ]
 fi
 
+# an ID already taken by another file: the file is skipped, naming both
+put vps2/clash.md x; cl=$(printf vps2/clash.md | sha256sum | cut -c1-12)
+sqlite3 "$KEEP_DB" "INSERT INTO items(id, source, path, agent, created_at,
+  updated_at, sha256, body) VALUES ('$cl', 'vps2', 'ghost.md', '', '', '', '', '')"
+no "keep import '$I'"
+grep -qxF "keep: skipped $I/vps2/clash.md: ID $cl is taken by vps2/ghost.md" "$T/err"
+[ "$(n "id='$cl' AND path='ghost.md'")" -eq 1 ]
+sqlite3 "$KEEP_DB" "DELETE FROM items WHERE id='$cl'"; keep import "$I"
+[ "$(n "id='$cl' AND path='clash.md'")" -eq 1 ]; rm "$I/vps2/clash.md"; keep import "$I"
+
+# an inbox with no readable .md files deletes nothing and exits 1
+mkdir -p "$T/void/vps1"; before=$(n 1); no "keep import '$T/void'"
+[ "$(cat "$T/err")" = "keep: no readable .md files in $T/void; deleted nothing" ]
+[ "$(n 1)" -eq "$before" ]
+
 # symlinks and other non-regular files are ignored without a message
 before=$(n 1); ln -s a.md "$I/vps2/link.md"; mkfifo "$I/vps2/fifo.md"
 ln -s ../vps1 "$I/vps2/sub"; ln -s vps1 "$I/vps9"
@@ -75,12 +92,13 @@ keep import "$I" 2>"$T/err"; [ ! -s "$T/err" ]; [ "$(n 1)" -eq "$before" ]
 
 # invalid input writes nothing; only init creates a DB
 no "keep import '$T/missing'"; no "keep show 000000000000"; no "keep flag 000000000000"
-no "keep search x --limit 0"; no "env -u KEEP_OUT keep flag $c"
+no "keep search x --limit 0"; no "keep search --limit abc"; no "env -u KEEP_OUT keep flag $c"
 no "keep search --bogus"; no "keep show"
 no "KEEP_DB='$T/none/keep.db' keep search"; [ ! -e "$T/none" ]
 [ "$(n 1)" -eq "$before" ]; [ ! -e "$KEEP_OUT" ]
 
-# search: CJK, punctuation, wildcards, case, text after a NUL, no hits, no terms
+# search: CJK, punctuation, wildcards, case, text after a NUL, phrases,
+# no hits, no terms
 hits 数据库;        [ "$h" -eq 1 ]
 hits 部署;          [ "$h" -eq 1 ]
 hits foo-bar;       [ "$h" -eq 1 ]
@@ -89,11 +107,16 @@ hits FOO-BAR ok;    [ "$h" -eq 1 ]
 hits ÉTÉ;           [ "$h" -eq 1 ]
 hits _;             [ "$h" -eq 1 ]
 hits %%;            [ "$h" -eq 0 ]
-hits nul;           [ "$h" -eq 1 ]
+hits afternul;      [ "$h" -eq 1 ]
+hits 'see foo';     [ "$h" -eq 1 ]             # one argument: one substring
+hits 'foo see';     [ "$h" -eq 0 ]
+hits foo see;       [ "$h" -eq 1 ]             # several arguments: all match
+hits 'done_ok, ÉTÉ'; [ "$h" -eq 1 ]
 hits AND;           hits '"'
 hits row --limit 5; [ "$h" -eq 5 ]
 hits same --source vps3; [ "$h" -eq 1 ]
 hits;               [ "$h" -eq 20 ]             # every row, default limit
+keep search --limit 1000 2>"$T/err" | :; [ ! -s "$T/err" ]  # closed pipe: quiet
 
 # newest first: an old row whose content changed comes back to the top
 put vps2/b.md "b again"; touch -d '2030-01-01 00:00:00 UTC' "$I/vps2/b.md"
@@ -131,6 +154,11 @@ printf '%s\n' --- 'agent: warden' --- q2 >"$I/vps1/$p/q.md"; keep import "$I"
 printf '%s\n' --- 'created_at: 2026-06-01T00:00:00Z' '  agent: nested' --- q3 >"$I/vps1/$p/q.md"
 keep import "$I"; [ "$(am "$p/q.md")" = "scout|2026-06-01T00:00:00Z" ]
 
+# --agent keeps the rows whose agent is exactly the name
+hits --agent scout; [ "$h" -eq 2 ]; hits q3 --agent scout; [ "$h" -eq 1 ]
+hits --agent Scout; [ "$h" -eq 0 ]; hits --agent scout --source vps2; [ "$h" -eq 0 ]
+hits --agent ranger; [ "$h" -eq 0 ]
+
 # show: Keep's frontmatter, then the file byte for byte (its own frontmatter,
 # CRLF and a missing final newline included); non-ASCII stays as UTF-8,
 # characters YAML forbids are escaped
@@ -151,6 +179,7 @@ keep show "$id" >"$T/show"; keep flag "$id"; cmp "$f" "$T/show"
 put "vps1/Disk: Full!.md" "disk full again"; keep import "$I"; cmp "$f" "$T/show"
 keep flag "$id"; [ "$(grep -c 'disk full again' "$f")" -eq 1 ]
 [ "$(ls -A "$KEEP_OUT/Items")" = "$id-disk-full-md.md" ]
+HOME=$T KEEP_OUT='~/home-out' keep flag "$id"; [ -f "$T/home-out/Items/$id-disk-full-md.md" ]
 
 # slug: runs outside [A-Za-z0-9] become -, then lowercased, cut to 40
 put "vps1/notes/Quarterly Review — Churn & Retention 2026 Final.md" qr; keep import "$I"

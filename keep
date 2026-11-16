@@ -149,12 +149,12 @@ def cmd_import(a):
     if not os.path.isdir(inbox):
         raise KeepError("%s is not a directory" % a.inbox)
     con = connect()
-    seen, skipped = set(), []
+    seen, frozen = set(), set()  # frozen: machines with a skipped file
 
     def skip(path, why):
-        skipped.append(path)
-        sys.stderr.write("keep: skipped %s: %s\n" % (
-            one_line(path.decode("utf-8", "backslashreplace")), why))
+        frozen.add(machine)
+        sys.stderr.write("keep: skipped %s\n" % one_line("%s: %s" % (
+            path.decode("utf-8", "backslashreplace"), why)))
 
     for machine in sorted(os.listdir(inbox)):
         top = os.path.join(inbox, machine)
@@ -184,32 +184,43 @@ def cmd_import(a):
                     skip(path, "not UTF-8")
                     continue
                 i = item_id(source, rel)
-                seen.add(i)
                 fm = frontmatter(body)
                 m = re.search(r"(?:^|/)profiles/([^/]+)/", rel)
-                con.execute(UPSERT, {
-                    "id": i, "source": source, "path": rel, "body": body,
-                    "agent": fm.get("agent") or (m.group(1) if m else ""),
-                    "created": fm.get("created_at") or None,
-                    "sha256": hashlib.sha256(data).hexdigest(),
-                    "mtime": utc(st.st_mtime)})
-    if skipped:
-        sys.exit(1)  # each skipped file was named on stderr; nothing deleted
-    for (i,) in con.execute("SELECT id FROM items").fetchall():
-        if i not in seen:
+                try:
+                    con.execute(UPSERT, {
+                        "id": i, "source": source, "path": rel, "body": body,
+                        "agent": fm.get("agent") or (m.group(1) if m else ""),
+                        "created": fm.get("created_at") or None,
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "mtime": utc(st.st_mtime)})
+                except sqlite3.IntegrityError:  # only the id can clash
+                    r = get_row(con, i)
+                    skip(path, "ID %s is taken by %s/%s"
+                         % (i, r["source"], r["path"]))
+                    continue
+                seen.add(i)
+    rows = con.execute("SELECT id, source FROM items").fetchall()
+    if rows and not seen:
+        raise KeepError("no readable .md files in %s; deleted nothing"
+                        % a.inbox)
+    for i, source in rows:  # a machine with a skipped file keeps its rows
+        if i not in seen and source.encode() not in frozen:
             con.execute("DELETE FROM items WHERE id=?", (i,))
+    if frozen:
+        sys.exit(1)  # each skipped file was named on stderr
 
 
 def cmd_search(a):
     if a.limit < 1:
         raise KeepError("--limit must be at least 1")
-    terms = [t.casefold() for t in " ".join(a.terms).split()]
+    terms = [t.casefold() for t in a.terms]  # each argument is one substring
+    where = [(c, v) for c, v in (("source", a.source), ("agent", a.agent))
+             if v is not None]
     sql = "SELECT id, updated_at, source, path, body FROM items"
-    args = []
-    if a.source:
-        sql += " WHERE source = ?"
-        args.append(a.source)
+    if where:
+        sql += " WHERE " + " AND ".join(c + " = ?" for c, _ in where)
     sql += " ORDER BY updated_at DESC, source, path"
+    args = [v for _, v in where]
     n = 0
     for r in connect().execute(sql, args):
         text = (r["path"] + "\n" + r["body"]).casefold()
@@ -229,7 +240,7 @@ def cmd_flag(a):
     if not out:
         raise KeepError("KEEP_OUT is not set")
     r = get_row(connect(), a.id)
-    d = os.path.join(out, "Items")
+    d = os.path.join(os.path.expanduser(out), "Items")
     os.makedirs(d, exist_ok=True)
     name = item_name(r)
     tmp = os.path.join(d, ".%s.%d.tmp" % (name, os.getpid()))
@@ -248,12 +259,17 @@ def main(argv):
     p = sub.add_parser("search")
     p.add_argument("terms", nargs="*")
     p.add_argument("--source", metavar="MACHINE")
+    p.add_argument("--agent", metavar="NAME")
     p.add_argument("--limit", type=int, default=20)
     for name in ("show", "flag"):
         sub.add_parser(name).add_argument("id")
     a = ap.parse_args(argv)
     try:
         globals()["cmd_" + a.cmd](a)
+        sys.stdout.flush()
+    except BrokenPipeError:  # e.g. `keep search | head -1`: stop quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
     except (KeepError, sqlite3.Error, OSError) as e:
         sys.stderr.write("keep: %s\n" % e)
         sys.exit(1)

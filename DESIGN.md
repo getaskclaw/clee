@@ -33,6 +33,8 @@ What Keep does guarantee:
 | `$KEEP_DB` | `~/.keep/keep.db` |
 | `$KEEP_OUT` | No default. `flag` exits 1 if it is unset. |
 
+A leading `~` in either is expanded; a relative path is relative to the current directory.
+
 ## Schema
 
 ```sql
@@ -51,7 +53,7 @@ CREATE TABLE items (
 PRAGMA user_version = 2;
 ```
 
-- One row per file in the inbox. The ID is computed from `source + "/" + path` (UTF-8), so a file has the same ID in every DB built from the inbox. Two files whose IDs collide (unlikely below millions of files) make `import` fail rather than mix their rows.
+- One row per file in the inbox. The ID is computed from `source + "/" + path` (UTF-8), so a file has the same ID in every DB built from the inbox. Two files whose IDs collide (unlikely below millions of files) never mix their rows: the one imported second is skipped (see Import) with the reason `ID <id> is taken by <source>/<path>`.
 - Times Keep sets are UTC, `YYYY-MM-DDTHH:MM:SSZ`; a `created_at` from frontmatter is stored as written.
 
 Metadata, set by `import`:
@@ -69,7 +71,7 @@ Metadata, set by `import`:
 |---|---|
 | `keep init` | Create the DB, and any missing directories above it. Safe to rerun. Exits 1 if SQLite is older than 3.24. |
 | `keep import <inbox>` | Bring the DB in line with the inbox. |
-| `keep search [<term>...] [--source <machine>] [--limit <n>]` | List rows, newest `updated_at` first. `<n>` is at least 1; default 20. |
+| `keep search [<term>...] [--source <machine>] [--agent <name>] [--limit <n>]` | List rows, newest `updated_at` first. `<n>` is at least 1; default 20. |
 | `keep show <id>` | Print a row as its item file would be. |
 | `keep flag <id>` | Write the row to `$KEEP_OUT/Items/` now. Run by a person on the central machine; agents only write files. |
 
@@ -77,7 +79,7 @@ Conventions:
 
 - **Connections**: every statement is its own transaction and waits up to 5 seconds for a lock. Every command except `init` exits 1 if the DB does not exist, and creates nothing.
 - **Schema version**: every command, `init` included, exits 1 if the DB's `user_version` is not 2, so a DB from another version of Keep is never misread; rebuild it instead.
-- **Exit codes**: 0 on success, 1 on any error (usage errors included), with a message on stderr. Invalid input (unknown ID, missing inbox, unset `$KEEP_OUT`, invalid value) writes nothing. `import` also exits 1 when it skipped a file (see Import).
+- **Exit codes**: 0 on success, 1 on any error (usage errors included), with a message on stderr. Invalid input (unknown ID, missing inbox, unset `$KEEP_OUT`, invalid value) writes nothing. `import` also exits 1 when it skipped a file or found no file to read (see Import). A reader that closes `search`'s output early (`keep search | head -1`) ends it quietly.
 - **Encoding**: Keep reads and writes UTF-8, whatever the locale.
 - **Output**:
   - `init`, `import` and `flag` print nothing on success.
@@ -90,15 +92,16 @@ Conventions:
 - Each directory directly under `<inbox>` is a machine; its name is the `source`. Files directly under `<inbox>` are ignored.
 - Every regular file ending in `.md` below a machine directory is read, in dot-directories such as `.claude/` too. Symlinks (machine directories included), FIFOs and other non-regular files are ignored without a message. `path` is the file's path relative to its machine directory. The `body` is the whole file, byte for byte, its own frontmatter included; Keep reads only `agent` and `created_at` from it (see Schema). An empty file gives an empty body.
 - A new file adds a row; a file whose SHA-256 changed rewrites its row's `agent`, `created_at`, `updated_at`, `sha256` and `body`; any other file is left alone, even if its mtime changed, so reruns change nothing. A file no longer in the inbox loses its row. rsync `-t` keeps mtimes. A renamed file is a new row with a new ID.
-- A file that cannot be read, or whose content or name is not UTF-8, is skipped with one line on stderr, `keep: skipped <file>: <reason>`, and the run goes on. `<file>` is the path Keep opened, `<inbox>/<machine>/<path>`, with bytes that are not UTF-8 shown as `\xNN`; `<reason>` is `not UTF-8` or the system's error text, such as `Permission denied`. A directory that cannot be read is reported the same way. A run that skipped anything deletes no rows and exits 1, so cron reports it, and every later run reports it again. Fix or delete the file on the machine it came from, or the next sync brings it back.
+- A file that cannot be read, or whose content or name is not UTF-8, is skipped with one line on stderr, `keep: skipped <file>: <reason>`, and the run goes on. `<file>` is the path Keep opened, `<inbox>/<machine>/<path>`, with bytes that are not UTF-8 shown as `\xNN`; `<reason>` is `not UTF-8` or the system's error text, such as `Permission denied`. A directory that cannot be read is reported the same way. A run that skipped a file deletes no rows of that file's machine (other machines' rows are deleted as usual) and exits 1, so cron reports it, and every later run reports it again. Fix or delete the file on the machine it came from, or the next sync brings it back.
+- An inbox in which no file could be read (no machine directories, or no `.md` files in them, as when a mount or sync folder is missing) while the DB has rows deletes nothing and exits 1 with one line on stderr, `keep: no readable .md files in <inbox>; deleted nothing`. To empty Keep, delete `keep.db` and run `keep init`.
 - Each file is one statement, so a run that fails midway keeps what it wrote and a rerun does the rest. Run one import at a time (the README's cron line uses `flock`). Overlapping runs cannot corrupt the DB or duplicate rows, but can leave an older version, or drop a row, until the next run.
 
 ### Search
 
-- Each term must appear in the path or the body, ignoring case (Python's `str.casefold`); all terms must match. Terms are plain substrings: no wildcards, no operators.
+- Each argument is one term, spaces included, and must appear in the path or the body, ignoring case (Python's `str.casefold`); all terms must match. So `keep search "disk full"` finds the phrase, and `keep search disk full` finds rows with both words anywhere. Terms are plain substrings: no wildcards, no operators.
 - With no terms every row matches, so `keep search` alone lists the most recently changed files.
 - Rows are ordered by `updated_at`, newest first, then by source and path. A file whose content changes moves back to the top.
-- `--source` keeps one machine's rows. There is no agent filter; an agent's name is in its files' paths or frontmatter, so search for it.
+- `--source` keeps the rows whose `source` is exactly `<machine>`; `--agent` keeps the rows whose `agent` is exactly `<name>` (case matters). Given both, a row must match both.
 
 ## Flag
 
@@ -113,192 +116,7 @@ There are no migrations. After a schema change (Keep exits 1 on the old DB) or a
 
 ## Acceptance
 
-The script below is the acceptance test; it checks the behaviour above, not every sentence (it does not check the SQLite version test in `init`). It needs `keep` on `PATH`, the `sqlite3` CLI, `sha256sum`, `cmp` and GNU coreutils (`touch`, `env`, `mkfifo`) on Linux. The unreadable-file cases are skipped when run as root. A failing case means either the implementation or this document is wrong. Search results are counted through a file, so a failing `search` stops the script instead of hiding behind a pipe.
-
-```sh
-#!/bin/sh
-# acceptance.sh — exits non-zero on the first failure
-set -eu
-T=$(mktemp -d); I=$T/inbox
-export KEEP_DB=$T/db/sub/keep.db KEEP_OUT=$T/out
-n()   { sqlite3 "$KEEP_DB" "SELECT count(*) FROM items WHERE $1"; }
-q()   { sqlite3 "$KEEP_DB" "SELECT $1 FROM items WHERE $2"; }
-idof() { q id "path='$1'"; }
-no()  { rc=0; sh -c "$1" >/dev/null 2>"$T/err" || rc=$?   # stderr kept in $T/err
-        [ "$rc" -eq 1 ] || { echo "FAIL, want exit 1, got $rc: $1"; exit 1; }; }
-hits() { keep search "$@" >"$T/hits"; h=$(wc -l <"$T/hits"); }  # keeps search's exit code
-put() { mkdir -p "$(dirname "$I/$1")"; printf '%s\n' "$2" >"$I/$1"; }
-
-# init creates missing directories, is safe to rerun, and refuses other schemas
-keep init; keep init; [ -f "$KEEP_DB" ]
-sqlite3 "$T/old.db" "CREATE TABLE items (id INTEGER PRIMARY KEY)"
-no "KEEP_DB='$T/old.db' keep init"; no "KEEP_DB='$T/old.db' keep search"
-sqlite3 "$T/old.db" "PRAGMA user_version = 1"; no "KEEP_DB='$T/old.db' keep search"
-
-# import: source is the machine directory; *.md only, empty files and
-# dot-directories too; the ID comes from source/path
-for i in $(seq 20); do put "vps1/logs/row-$i.md" "row $i"; done
-put vps2/a.md "部署完成，数据库迁移成功"
-put vps2/b.md "see foo-bar and a:b, done_ok, été"
-put vps2/notes.txt "not markdown"; : >"$I/vps2/empty.md"; put stray.md "no machine"
-put vps2/.claude/memo.md x
-keep import "$I"
-[ "$(n 1)" -eq 24 ]; [ "$(n "source='vps1' AND path LIKE 'logs/row-%.md'")" -eq 20 ]
-[ "$(n "source='vps2' AND path='empty.md' AND body=''")" -eq 1 ]
-[ "$(n "source='vps2' AND path='.claude/memo.md'")" -eq 1 ]
-[ "$(idof a.md)" = "$(printf vps2/a.md | sha256sum | cut -c1-12)" ]
-
-# one row per source and path, holding the latest version; reruns add nothing
-keep import "$I"; [ "$(n 1)" -eq 24 ]
-put vps2/c.md "version-one"; keep import "$I"; c=$(idof c.md)
-put vps2/c.md "version-two"; keep import "$I"; keep import "$I"
-hash=$(sha256sum <"$I/vps2/c.md" | cut -d' ' -f1)
-[ "$(n "path='c.md'")" -eq 1 ]; [ "$(idof c.md)" = "$c" ]
-[ "$(n "id='$c' AND body LIKE 'version-two%' AND sha256='$hash'")" -eq 1 ]
-hits version-one; [ "$h" -eq 0 ]; hits version-two; [ "$h" -eq 1 ]
-: >"$I/vps2/c.md"; keep import "$I"; [ "$(n "id='$c' AND body=''")" -eq 1 ]
-put vps1/same.md "same"; put vps3/same.md "same"; keep import "$I"
-[ "$(n "path='same.md'")" -eq 2 ]
-
-# a file gone from the inbox loses its row; back again, it has the same ID
-s3=$(q id "source='vps3'"); rm "$I/vps3/same.md"; keep import "$I"
-[ "$(n "source='vps3'")" -eq 0 ]
-put vps3/same.md "same"; keep import "$I"; [ "$(q id "source='vps3'")" = "$s3" ]
-
-# a skipped file is named on stderr and import exits 1; the rest still
-# imports, and nothing is deleted
-printf 'ok\377\n' >"$I/vps2/bin.md"; printf '\000nul\n' >"$I/vps2/nul.md"
-bad=$I/vps2/$(printf 'bad\377').md; printf x >"$bad"; rm "$I/vps2/empty.md"
-no "keep import '$I'"; grep -qxF "keep: skipped $I/vps2/bin.md: not UTF-8" "$T/err"
-grep -qxF "keep: skipped $I/vps2/bad\\xff.md: not UTF-8" "$T/err"
-[ "$(wc -l <"$T/err")" -eq 2 ]
-[ "$(n "path='bin.md'")" -eq 0 ]; [ "$(n "path='nul.md'")" -eq 1 ]
-[ "$(n "path='empty.md'")" -eq 1 ]
-rm "$I/vps2/bin.md" "$bad"; keep import "$I"; [ "$(n "path='empty.md'")" -eq 0 ]
-if [ "$(id -u)" -ne 0 ]; then                   # root can read anything
-  put vps2/locked/x.md x; keep import "$I"
-  put vps2/noread.md x; chmod 000 "$I/vps2/noread.md" "$I/vps2/locked"
-  no "keep import '$I'"
-  grep -qxF "keep: skipped $I/vps2/noread.md: Permission denied" "$T/err"
-  grep -qxF "keep: skipped $I/vps2/locked: Permission denied" "$T/err"
-  [ "$(n "path='locked/x.md'")" -eq 1 ]
-  chmod 700 "$I/vps2/locked"; rm -r "$I/vps2/noread.md" "$I/vps2/locked"
-  keep import "$I"; [ "$(n "path='locked/x.md'")" -eq 0 ]
-fi
-
-# symlinks and other non-regular files are ignored without a message
-before=$(n 1); ln -s a.md "$I/vps2/link.md"; mkfifo "$I/vps2/fifo.md"
-ln -s ../vps1 "$I/vps2/sub"; ln -s vps1 "$I/vps9"
-keep import "$I" 2>"$T/err"; [ ! -s "$T/err" ]; [ "$(n 1)" -eq "$before" ]
-
-# invalid input writes nothing; only init creates a DB
-no "keep import '$T/missing'"; no "keep show 000000000000"; no "keep flag 000000000000"
-no "keep search x --limit 0"; no "env -u KEEP_OUT keep flag $c"
-no "keep search --bogus"; no "keep show"
-no "KEEP_DB='$T/none/keep.db' keep search"; [ ! -e "$T/none" ]
-[ "$(n 1)" -eq "$before" ]; [ ! -e "$KEEP_OUT" ]
-
-# search: CJK, punctuation, wildcards, case, text after a NUL, no hits, no terms
-hits 数据库;        [ "$h" -eq 1 ]
-hits 部署;          [ "$h" -eq 1 ]
-hits foo-bar;       [ "$h" -eq 1 ]
-hits a:b;           [ "$h" -eq 1 ]
-hits FOO-BAR ok;    [ "$h" -eq 1 ]
-hits ÉTÉ;           [ "$h" -eq 1 ]
-hits _;             [ "$h" -eq 1 ]
-hits %%;            [ "$h" -eq 0 ]
-hits nul;           [ "$h" -eq 1 ]
-hits AND;           hits '"'
-hits row --limit 5; [ "$h" -eq 5 ]
-hits same --source vps3; [ "$h" -eq 1 ]
-hits;               [ "$h" -eq 20 ]             # every row, default limit
-
-# newest first: an old row whose content changed comes back to the top
-put vps2/b.md "b again"; touch -d '2030-01-01 00:00:00 UTC' "$I/vps2/b.md"
-keep import "$I"; hits
-printf '%s\t2030-01-01T00:00:00Z\tvps2\tb.md\n' "$(idof b.md)" >"$T/want"
-head -1 "$T/hits" | cmp - "$T/want"
-
-# metadata: created_at is the mtime at first import when the frontmatter has
-# none; updated_at is the mtime when the content last changed (a touch alone
-# changes nothing); imported_at is set when the row is added
-am() { q "agent||'|'||created_at" "path='$1'"; }
-[ "$(n "imported_at GLOB '20[0-9][0-9]-[01][0-9]-[0-3][0-9]T*Z'")" -eq "$(n 1)" ]
-put vps1/m.md m1; touch -d '2026-01-02 03:04:05 UTC' "$I/vps1/m.md"; keep import "$I"
-m=$(idof m.md); [ "$(am m.md)" = "|2026-01-02T03:04:05Z" ]
-[ "$(q updated_at "id='$m'")" = 2026-01-02T03:04:05Z ]
-touch -d '2026-02-03 04:05:06 UTC' "$I/vps1/m.md"; keep import "$I"
-[ "$(q updated_at "id='$m'")" = 2026-01-02T03:04:05Z ]
-sqlite3 "$KEEP_DB" "UPDATE items SET imported_at='2000-01-01T00:00:00Z' WHERE id='$m'"
-put vps1/m.md m2; touch -d '2026-03-04 05:06:07 UTC' "$I/vps1/m.md"
-keep import "$I"; keep import "$I"
-[ "$(am m.md)|$(q updated_at "id='$m'")" = "|2026-01-02T03:04:05Z|2026-03-04T05:06:07Z" ]
-[ "$(n "id='$m' AND source='vps1' AND body LIKE 'm2%' AND imported_at LIKE '2000-%'")" -eq 1 ]
-
-# agent: the frontmatter's agent, else <name> from profiles/<name>/ in the
-# path, else empty; agent and created_at are read again from each new version
-p=.hermes/profiles/scout; put "vps1/$p/notes/p.md" p; put vps1/profiles/x.md x
-printf '%s\n' --- 'agent: "ranger"' "created_at: '2025-12-31T23:59:59Z'" --- q >"$I/vps1/$p/q.md"
-printf '%s\n' text --- 'agent: x' --- >"$I/vps1/nf.md"; printf '%s\n' --- 'agent: x' >"$I/vps1/un.md"
-keep import "$I"
-[ "$(q agent "path='$p/notes/p.md'")" = scout ]
-[ "$(am "$p/q.md")" = "ranger|2025-12-31T23:59:59Z" ]
-[ "$(n "path IN ('profiles/x.md', 'nf.md', 'un.md') AND agent=''")" -eq 3 ]
-printf '%s\n' --- 'agent: warden' --- q2 >"$I/vps1/$p/q.md"; keep import "$I"
-[ "$(am "$p/q.md")" = "warden|2025-12-31T23:59:59Z" ]
-printf '%s\n' --- 'created_at: 2026-06-01T00:00:00Z' '  agent: nested' --- q3 >"$I/vps1/$p/q.md"
-keep import "$I"; [ "$(am "$p/q.md")" = "scout|2026-06-01T00:00:00Z" ]
-
-# show: Keep's frontmatter, then the file byte for byte (its own frontmatter,
-# CRLF and a missing final newline included); non-ASCII stays as UTF-8,
-# characters YAML forbids are escaped
-printf '%s\r\n' --- 'agent: scout' --- >"$I/vps2/fm.md"; printf 'no final newline' >>"$I/vps2/fm.md"
-keep import "$I"; keep show "$(idof fm.md)" >"$T/show"
-tail -n +11 "$T/show" | cmp - "$I/vps2/fm.md"
-grep -qx "sha256: \"$(q sha256 "path='fm.md'")\"" "$T/show"; grep -qxF 'agent: "scout"' "$T/show"
-put vps1/日志😀.md x; put "vps1/del$(printf '\177').md" x; keep import "$I"
-keep show "$(idof 日志😀.md)" >"$T/show"; grep -qxF 'path: "日志😀.md"' "$T/show"
-keep show "$(q id "path LIKE 'del%'")" >"$T/show"; grep -qxF 'path: "del\u007f.md"' "$T/show"
-
-# flag writes the item file now, exactly what show printed; imports leave it
-# alone; flagging again rewrites it
-put "vps1/Disk: Full!.md" "disk full on db-1"; keep import "$I"
-id=$(idof 'Disk: Full!.md'); f=$KEEP_OUT/Items/$id-disk-full-md.md
-keep show "$id" >"$T/show"; keep flag "$id"; cmp "$f" "$T/show"
-[ "$(sed -n '2,9p' "$f" | cut -d: -f1 | tr '\n' ' ')" = "keep_id source path agent created_at updated_at imported_at sha256 " ]
-put "vps1/Disk: Full!.md" "disk full again"; keep import "$I"; cmp "$f" "$T/show"
-keep flag "$id"; [ "$(grep -c 'disk full again' "$f")" -eq 1 ]
-[ "$(ls -A "$KEEP_OUT/Items")" = "$id-disk-full-md.md" ]
-
-# slug: runs outside [A-Za-z0-9] become -, then lowercased, cut to 40
-put "vps1/notes/Quarterly Review — Churn & Retention 2026 Final.md" qr; keep import "$I"
-s=$(idof 'notes/Quarterly Review — Churn & Retention 2026 Final.md'); keep flag "$s"
-[ -f "$KEEP_OUT/Items/$s-quarterly-review-churn-retention-2026-fi.md" ]
-
-# a failing flag exits 1
-: >"$T/notadir"; no "KEEP_OUT='$T/notadir' keep flag $id"
-
-# a file or directory name cannot inject frontmatter or split a search line
-put "vps1
-evil: 1/x
----
-evil: 2.md" body; keep import "$I"
-j=$(q id "path LIKE 'x%'")
-keep flag "$j"
-[ "$(grep -c '^evil:' "$KEEP_OUT"/Items/"$j"-*.md)" -eq 0 ]
-hits evil; [ "$h" -eq 1 ]; [ "$(cut -f1 "$T/hits")" = "$j" ]
-
-# rebuild from the inbox: the same rows, IDs and agents included; created_at
-# from frontmatter survives, the mtime fallback becomes the current mtime
-rows="SELECT id, source, path, agent, sha256, body FROM items ORDER BY id"
-sqlite3 "$KEEP_DB" "$rows" >"$T/before"
-rm "$KEEP_DB"; keep init; keep import "$I"
-sqlite3 "$KEEP_DB" "$rows" | cmp - "$T/before"
-[ "$(am "$p/q.md")" = "scout|2026-06-01T00:00:00Z" ]
-[ "$(am m.md)|$(q updated_at "id='$m'")" = "|2026-03-04T05:06:07Z|2026-03-04T05:06:07Z" ]
-
-echo "all acceptance cases passed"
-```
+[`acceptance.sh`](acceptance.sh) is the acceptance test; run it as `PATH=$PWD:$PATH sh acceptance.sh`. It checks the behaviour above, not every sentence (it does not check the SQLite version test in `init`). It needs the `sqlite3` CLI, `sha256sum`, `cmp` and GNU coreutils (`touch`, `env`, `mkfifo`) on Linux. The unreadable-file cases are skipped when run as root. A failing case means either the implementation or this document is wrong.
 
 ## Non-goals
 
