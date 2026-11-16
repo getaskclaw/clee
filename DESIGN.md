@@ -18,10 +18,9 @@ What Keep does guarantee:
 
 ## Components
 
-- **Sync (not part of Keep)**: each machine pushes its Markdown one way into `<inbox>/<machine>/` on the central machine, under a name no other machine uses; two machines sharing a name overwrite each other's files. Any tool that writes complete files by rename works, such as this cron line (`-rt` without `-l` skips symlinks):
+- **Sync (not part of Keep)**: each machine pushes its Markdown one way into `<inbox>/<machine>/` on the central machine, under a name no other machine uses; two machines sharing a name overwrite each other's files. Sync is rsync from cron (`-rt` without `-l` skips symlinks; rsync writes each file under a temporary name and renames it into place):
   `rsync -rt --include='*/' --include='*.md' --exclude='*' ~/hermes-notes/ central:keep-inbox/laptop/`
-  Syncthing with a Send Only folder on each machine also works.
-- **Inbox**: the record. Keep only reads it, and the DB mirrors it: a file is in Keep exactly while it is in the inbox. Syncthing passes deletions on, so a file deleted on its machine leaves Keep at the next import; rsync without `--delete` does not, so delete such files from the inbox yourself.
+- **Inbox**: the record. Keep only reads it, and the DB mirrors it: a file is in Keep exactly while it is in the inbox. rsync without `--delete` does not pass deletions on, so delete such files from the inbox yourself.
 - **`keep.db`**: the index, SQLite at `$KEEP_DB`, on a local disk, outside any synced folder. It can be deleted and rebuilt at any time (see Rebuild).
 - **`keep` CLI**: one Python 3.9+ file, standard library only, MIT licensed, needing SQLite 3.24+. Installed on the central machine only, and the only writer of the DB.
 - **Output folder**: `$KEEP_OUT/Items/`, written only by `keep flag`. It may sit inside a synced folder or an Obsidian vault.
@@ -79,8 +78,8 @@ Conventions:
 
 - **Connections**: every statement is its own transaction and waits up to 5 seconds for a lock. Every command except `init` exits 1 if the DB does not exist, and creates nothing.
 - **Schema version**: every command, `init` included, exits 1 if the DB's `user_version` is not 2, so a DB from another version of Keep is never misread; rebuild it instead.
-- **Exit codes**: 0 on success, 1 on any error (usage errors included), with a message on stderr. Invalid input (unknown ID, missing inbox, unset `$KEEP_OUT`, invalid value) writes nothing. `import` also exits 1 when it skipped a file or found no file to read (see Import). A reader that closes `search`'s output early (`keep search | head -1`) ends it quietly.
-- **Encoding**: Keep reads and writes UTF-8, whatever the locale.
+- **Exit codes**: 0 on success, 1 on any error (usage errors included), with a message on stderr. Invalid input (unknown ID, missing inbox, unset `$KEEP_OUT`, invalid value) writes nothing. `import` also exits 1 when it skipped a file or found a machine directory, or the whole inbox, with no file to read (see Import). A reader that closes `search`'s output early (`keep search | head -1`) ends it quietly.
+- **Encoding**: Keep reads and writes UTF-8, whatever the locale. A command-line argument that is not UTF-8 exits 1 with one line on stderr, `keep: argument is not UTF-8: <arg>`, bytes that are not UTF-8 shown as `\xNN`.
 - **Output**:
   - `init`, `import` and `flag` print nothing on success.
   - `search` prints one line per row, `id<TAB>updated_at<TAB>source<TAB>path`. No hits prints nothing and exits 0.
@@ -92,8 +91,9 @@ Conventions:
 - Each directory directly under `<inbox>` is a machine; its name is the `source`. Files directly under `<inbox>` are ignored.
 - Every regular file ending in `.md` below a machine directory is read, in dot-directories such as `.claude/` too. Symlinks (machine directories included), FIFOs and other non-regular files are ignored without a message. `path` is the file's path relative to its machine directory. The `body` is the whole file, byte for byte, its own frontmatter included; Keep reads only `agent` and `created_at` from it (see Schema). An empty file gives an empty body.
 - A new file adds a row; a file whose SHA-256 changed rewrites its row's `agent`, `created_at`, `updated_at`, `sha256` and `body`; any other file is left alone, even if its mtime changed, so reruns change nothing. A file no longer in the inbox loses its row. rsync `-t` keeps mtimes. A renamed file is a new row with a new ID.
-- A file that cannot be read, or whose content or name is not UTF-8, is skipped with one line on stderr, `keep: skipped <file>: <reason>`, and the run goes on. `<file>` is the path Keep opened, `<inbox>/<machine>/<path>`, with bytes that are not UTF-8 shown as `\xNN`; `<reason>` is `not UTF-8` or the system's error text, such as `Permission denied`. A directory that cannot be read is reported the same way. A run that skipped a file deletes no rows of that file's machine (other machines' rows are deleted as usual) and exits 1, so cron reports it, and every later run reports it again. Fix or delete the file on the machine it came from, or the next sync brings it back.
-- An inbox in which no file could be read (no machine directories, or no `.md` files in them, as when a mount or sync folder is missing) while the DB has rows deletes nothing and exits 1 with one line on stderr, `keep: no readable .md files in <inbox>; deleted nothing`. To empty Keep, delete `keep.db` and run `keep init`.
+- A file that cannot be read, whose content or name is not UTF-8, or whose mtime cannot be written as a date (past year 9999, say), is skipped with one line on stderr, `keep: skipped <file>: <reason>`, and the run goes on. `<file>` is the path Keep opened, `<inbox>/<machine>/<path>`, with bytes that are not UTF-8 shown as `\xNN`; `<reason>` is `not UTF-8`, `mtime out of range`, or the system's error text, such as `Permission denied`. A directory that cannot be read is reported the same way. A run that skipped a file deletes no rows of that file's machine (other machines' rows are deleted as usual) and exits 1, so cron reports it, and every later run reports it again. Fix or delete the file on the machine it came from, or the next sync brings it back.
+- A machine directory in which no file could be read (empty, or holding no `.md` file), while the DB has rows of that machine, deletes none of them and writes one line on stderr, `keep: no readable .md files in <inbox>/<machine>; deleted nothing from it`; the run goes on with the other machines and exits 1. A new machine directory with no file is no error. To drop a machine, delete its directory from the inbox.
+- An inbox in which no file could be read at all (no machine directories, or no `.md` files in them, as when a mount is missing) deletes nothing and exits 1 with one line on stderr, `keep: no readable .md files in <inbox>; deleted nothing`, on the first import too. To empty Keep, delete `keep.db` and run `keep init`.
 - Each file is one statement, so a run that fails midway keeps what it wrote and a rerun does the rest. Run one import at a time (the README's cron line uses `flock`). Overlapping runs cannot corrupt the DB or duplicate rows, but can leave an older version, or drop a row, until the next run.
 
 ### Search
@@ -116,7 +116,7 @@ There are no migrations. After a schema change (Keep exits 1 on the old DB) or a
 
 ## Acceptance
 
-[`acceptance.sh`](acceptance.sh) is the acceptance test; run it as `PATH=$PWD:$PATH sh acceptance.sh`. It checks the behaviour above, not every sentence (it does not check the SQLite version test in `init`). It needs the `sqlite3` CLI, `sha256sum`, `cmp` and GNU coreutils (`touch`, `env`, `mkfifo`) on Linux. The unreadable-file cases are skipped when run as root. A failing case means either the implementation or this document is wrong.
+[`acceptance.sh`](acceptance.sh) is the acceptance test; run it as `PATH=$PWD:$PATH sh acceptance.sh`. It checks the behaviour above, not every sentence (it does not check the SQLite version test in `init`). It needs the `sqlite3` CLI, `sha256sum`, `cmp` and GNU coreutils (`touch`, `env`, `mkfifo`, `stat`) on Linux. The unreadable-file cases are skipped when run as root, and the out-of-range mtime case when `/dev/shm` (tmpfs) is missing. A failing case means either the implementation or this document is wrong.
 
 ## Non-goals
 
@@ -135,7 +135,6 @@ There are no migrations. After a schema change (Keep exits 1 on the old DB) or a
 
 ## Risks
 
-- **Partial files**: a sync tool that writes in place could expose half a file, which import stores until the next run sees the whole file. Use tools that rename into place (rsync and Syncthing do).
-- **Unwanted files**: every `.md` file that reaches the inbox is imported, including Syncthing's `*.sync-conflict-*.md` files, its `.stversions/` folder if versioning is on at the central machine, and a vault's `.trash/`. Keep them out in the sync tool, or delete them from the inbox.
+- **Unwanted files**: every `.md` file that reaches the inbox is imported, including a vault's `.trash/`. Keep them out with an rsync `--exclude`, or delete them from the inbox.
 - **Scale**: every import reads every file and every search reads every row. That suits one person's notes; see Later.
 - **A newer body than the one read**: `flag` exports the row as it is when `flag` runs. If an import changes the row between `keep show` and `keep flag`, the newer body is exported; the item file's `sha256` tells which version it is.

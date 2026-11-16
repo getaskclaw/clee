@@ -149,17 +149,24 @@ def cmd_import(a):
     if not os.path.isdir(inbox):
         raise KeepError("%s is not a directory" % a.inbox)
     con = connect()
-    seen, frozen = set(), set()  # frozen: machines with a skipped file
+    seen, frozen = set(), set()  # frozen: machines whose rows are not deleted
+    found = {}  # machine directory -> number of files read from it
+
+    def name(path):
+        return path.decode("utf-8", "backslashreplace")
+
+    def say(msg):
+        sys.stderr.write("keep: %s\n" % one_line(msg))
 
     def skip(path, why):
         frozen.add(machine)
-        sys.stderr.write("keep: skipped %s\n" % one_line("%s: %s" % (
-            path.decode("utf-8", "backslashreplace"), why)))
+        say("skipped %s: %s" % (name(path), why))
 
     for machine in sorted(os.listdir(inbox)):
         top = os.path.join(inbox, machine)
         if not is_dir(top):
             continue
+        found[machine] = 0
         for d, dirs, files in os.walk(
                 top, onerror=lambda e: skip(e.filename, e.strerror)):
             dirs.sort()
@@ -183,6 +190,11 @@ def cmd_import(a):
                 except UnicodeError:
                     skip(path, "not UTF-8")
                     continue
+                try:
+                    mtime = utc(st.st_mtime)
+                except (ValueError, OverflowError, OSError):  # past year 9999
+                    skip(path, "mtime out of range")
+                    continue
                 i = item_id(source, rel)
                 fm = frontmatter(body)
                 m = re.search(r"(?:^|/)profiles/([^/]+)/", rel)
@@ -192,22 +204,29 @@ def cmd_import(a):
                         "agent": fm.get("agent") or (m.group(1) if m else ""),
                         "created": fm.get("created_at") or None,
                         "sha256": hashlib.sha256(data).hexdigest(),
-                        "mtime": utc(st.st_mtime)})
+                        "mtime": mtime})
                 except sqlite3.IntegrityError:  # only the id can clash
                     r = get_row(con, i)
                     skip(path, "ID %s is taken by %s/%s"
                          % (i, r["source"], r["path"]))
                     continue
                 seen.add(i)
-    rows = con.execute("SELECT id, source FROM items").fetchall()
-    if rows and not seen:
+                found[machine] += 1
+    if not seen:  # a missing mount, say: delete nothing, even on a first run
         raise KeepError("no readable .md files in %s; deleted nothing"
                         % a.inbox)
-    for i, source in rows:  # a machine with a skipped file keeps its rows
+    rows = con.execute("SELECT id, source FROM items").fetchall()
+    sources = {source.encode() for _, source in rows}
+    for machine, count in found.items():  # an emptied machine keeps its rows
+        if count == 0 and machine in sources:
+            frozen.add(machine)
+            say("no readable .md files in %s; deleted nothing from it"
+                % name(os.path.join(inbox, machine)))
+    for i, source in rows:  # a frozen machine keeps its rows
         if i not in seen and source.encode() not in frozen:
             con.execute("DELETE FROM items WHERE id=?", (i,))
     if frozen:
-        sys.exit(1)  # each skipped file was named on stderr
+        sys.exit(1)  # each reason was written on stderr
 
 
 def cmd_search(a):
@@ -252,6 +271,14 @@ def cmd_flag(a):
 def main(argv):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    for s in argv:
+        b = os.fsencode(s)
+        try:
+            b.decode("utf-8")
+        except UnicodeError:
+            sys.stderr.write("keep: argument is not UTF-8: %s\n"
+                             % one_line(b.decode("utf-8", "backslashreplace")))
+            sys.exit(1)
     ap = Parser(prog="keep")
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
     sub.add_parser("init")

@@ -1,8 +1,8 @@
 #!/bin/sh
 # acceptance.sh — exits non-zero on the first failure
 set -eu
-T=$(mktemp -d); I=$T/inbox
-trap 'chmod -R u+rwx "$T"; rm -rf "$T"' EXIT
+T=$(mktemp -d); I=$T/inbox; S=$T
+trap 'chmod -R u+rwx "$T"; rm -rf "$T" "$S"' EXIT
 export KEEP_DB=$T/db/sub/keep.db KEEP_OUT=$T/out
 n()   { sqlite3 "$KEEP_DB" "SELECT count(*) FROM items WHERE $1"; }
 q()   { sqlite3 "$KEEP_DB" "SELECT $1 FROM items WHERE $2"; }
@@ -44,9 +44,22 @@ put vps1/same.md "same"; put vps3/same.md "same"; keep import "$I"
 [ "$(n "path='same.md'")" -eq 2 ]
 
 # a file gone from the inbox loses its row; back again, it has the same ID
-s3=$(q id "source='vps3'"); rm "$I/vps3/same.md"; keep import "$I"
-[ "$(n "source='vps3'")" -eq 0 ]
-put vps3/same.md "same"; keep import "$I"; [ "$(q id "source='vps3'")" = "$s3" ]
+put vps3/other.md other; keep import "$I"
+s3=$(q id "source='vps3' AND path='same.md'"); rm "$I/vps3/same.md"; keep import "$I"
+[ "$(n "source='vps3'")" -eq 1 ]
+put vps3/same.md "same"; keep import "$I"; [ "$(q id "source='vps3' AND path='same.md'")" = "$s3" ]
+
+# a machine directory with no readable .md file, while the DB has rows from
+# it, keeps those rows and import exits 1; other machines import as usual
+# (a new empty machine is no error); a machine directory deleted from the
+# inbox loses its rows
+put vps1/gone.md gone; keep import "$I"; rm "$I/vps1/gone.md"; put vps1/new.md new
+mv "$I/vps3" "$T/vps3"; mkdir "$I/vps3" "$I/vps8"; no "keep import '$I'"
+[ "$(cat "$T/err")" = "keep: no readable .md files in $I/vps3; deleted nothing from it" ]
+[ "$(n "source='vps3'")" -eq 2 ]; [ "$(n "path='gone.md'")" -eq 0 ]; [ "$(n "path='new.md'")" -eq 1 ]
+rmdir "$I/vps3" "$I/vps8"; keep import "$I"; [ "$(n "source='vps3'")" -eq 0 ]
+mv "$T/vps3" "$I/vps3"; rm "$I/vps1/new.md"; keep import "$I"
+[ "$(q id "source='vps3' AND path='same.md'")" = "$s3" ]
 
 # a skipped file is named on stderr and import exits 1; the rest still
 # imports, and nothing is deleted from that machine; other machines are
@@ -84,6 +97,26 @@ sqlite3 "$KEEP_DB" "DELETE FROM items WHERE id='$cl'"; keep import "$I"
 mkdir -p "$T/void/vps1"; before=$(n 1); no "keep import '$T/void'"
 [ "$(cat "$T/err")" = "keep: no readable .md files in $T/void; deleted nothing" ]
 [ "$(n 1)" -eq "$before" ]
+KEEP_DB=$T/first.db keep init; no "KEEP_DB='$T/first.db' keep import '$T/void'"
+[ "$(cat "$T/err")" = "keep: no readable .md files in $T/void; deleted nothing" ]
+
+# a file whose mtime is past year 9999 is skipped; the rest still imports
+# (needs a filesystem that keeps such mtimes, such as tmpfs)
+S=$(mktemp -d -p /dev/shm 2>/dev/null) || S=$T
+mkdir "$S/vps1"; echo ok >"$S/vps1/ok.md"; : >"$S/vps1/far.md"; : >"$S/vps1/huge.md"
+touch -d @300000000000 "$S/vps1/far.md"; touch -d @4611686018427387904 "$S/vps1/huge.md" || :
+if [ "$(stat -c %Y "$S/vps1/far.md" "$S/vps1/huge.md" | tr '\n' ' ')" = "300000000000 4611686018427387904 " ]; then
+  KEEP_DB=$T/far.db keep init; no "KEEP_DB='$T/far.db' keep import '$S'"
+  printf 'keep: skipped %s/vps1/%s.md: mtime out of range\n' "$S" far "$S" huge | cmp - "$T/err"
+  [ "$(sqlite3 "$T/far.db" "SELECT path FROM items")" = ok.md ]
+else echo "skipped the mtime case: no filesystem here keeps such mtimes"
+fi
+
+# an argument that is not UTF-8 is one line on stderr, not a traceback
+for cmd in "search" "search --source" "show" "import"; do
+  no "keep $cmd 'x$(printf '\377')'"
+  [ "$(cat "$T/err")" = "keep: argument is not UTF-8: x\\xff" ]
+done
 
 # symlinks and other non-regular files are ignored without a message
 before=$(n 1); ln -s a.md "$I/vps2/link.md"; mkfifo "$I/vps2/fifo.md"
